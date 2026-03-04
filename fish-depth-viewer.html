@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Fish at Depth (Web)</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+    .panel { max-width: 860px; }
+    canvas { border: 1px solid #ccc; max-width: 100%; height: auto; cursor: crosshair; }
+    .controls { display: grid; gap: 10px; min-width: 280px; }
+    .controls label { display: grid; gap: 6px; }
+    .small { color: #444; font-size: 12px; line-height: 1.35; }
+    .btn { padding: 8px 10px; border: 1px solid #aaa; background: #f7f7f7; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1 style="margin:0 0 8px 0;">Fish at Depth (Web)</h1>
+  <div class="small" style="margin:0 0 14px 0;">
+    Simulates RGB attenuation with depth plus a simple pupil-compensation heuristic up to a luminance depth.
+    Flashlight reveals the original image only within a circular region.
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <canvas id="c" width="800" height="500"></canvas>
+    </div>
+
+    <div class="controls">
+      <label>
+        Load image
+        <input id="file" type="file" accept="image/*" />
+      </label>
+
+      <label>
+        Depth: <span id="depthLabel">0</span> m
+        <input id="depth" type="range" min="0" max="300" value="0" step="1" />
+      </label>
+
+      <label>
+        Luminance (pupil) depth: <span id="lumLabel">100</span> m
+        <input id="lum" type="range" min="0" max="200" value="100" step="1" />
+      </label>
+
+      <label>
+        Flashlight radius: <span id="radLabel">80</span> px
+        <input id="rad" type="range" min="20" max="250" value="80" step="1" />
+      </label>
+
+      <label>
+        <input id="flash" type="checkbox" />
+        Flashlight mode (hover to reveal original)
+      </label>
+
+      <button class="btn" id="demo">Load demo fish</button>
+
+      <div class="small">
+        Notes:
+        <ul>
+          <li>Up to luminance depth, blue is held constant (compensation heuristic), red/green reduced “less” than raw attenuation.</li>
+          <li>Below luminance depth, raw attenuation applies beyond that point.</li>
+          <li>Flashlight uses drawImage + clipping (works correctly; putImageData does not respect clipping).</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  const fileInput = document.getElementById('file');
+  const depthInput = document.getElementById('depth');
+  const lumInput = document.getElementById('lum');
+  const radInput = document.getElementById('rad');
+  const flashInput = document.getElementById('flash');
+
+  const depthLabel = document.getElementById('depthLabel');
+  const lumLabel = document.getElementById('lumLabel');
+  const radLabel = document.getElementById('radLabel');
+
+  const demoBtn = document.getElementById('demo');
+
+  // Raw attenuation (per meter) from the text you provided:
+  // Red loss 28.60% => factor 0.7139909
+  // Green loss 2.78% => factor 0.9722015
+  // Blue loss 1.37% => factor 0.98626776
+  const RAW = {
+    r: 0.7139909,
+    g: 0.9722015,
+    b: 0.98626776
+  };
+
+  // Compensation heuristic (Box 1):
+  // red: 1 - redLoss + blueLoss ≈ 0.727722
+  // green: 1 - greenLoss + blueLoss ≈ 0.985933
+  // blue: 1.0
+  const COMP = {
+    r: 0.727722,
+    g: 0.985933,
+    b: 1.0
+  };
+
+  let img = new Image();
+  img.crossOrigin = "anonymous";
+
+  // Stores the "original" pixels and a clip-safe backing canvas for flashlight reveal
+  let baseImageData = null;
+  const origCanvas = document.createElement('canvas');
+  const origCtx = origCanvas.getContext('2d', { willReadFrequently: true });
+
+  let mouse = { x: 0, y: 0, inside: false };
+
+  function fitAndDrawOriginal() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const cw = canvas.width, ch = canvas.height;
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    if (!iw || !ih) return;
+
+    // Fit image into canvas (contain)
+    const scale = Math.min(cw / iw, ch / ih);
+    const dw = Math.floor(iw * scale);
+    const dh = Math.floor(ih * scale);
+    const dx = Math.floor((cw - dw) / 2);
+    const dy = Math.floor((ch - dh) / 2);
+
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.drawImage(img, dx, dy, dw, dh);
+
+    // Capture original pixels
+    baseImageData = ctx.getImageData(0, 0, cw, ch);
+
+    // Copy original pixels into an offscreen canvas so flashlight can use drawImage (clip-safe)
+    origCanvas.width = cw;
+    origCanvas.height = ch;
+    origCtx.putImageData(baseImageData, 0, 0);
+  }
+
+  function clamp255(v) {
+    return v < 0 ? 0 : (v > 255 ? 255 : v);
+  }
+
+  function applyDepthTransform(depth, lumDepth) {
+    if (!baseImageData) return;
+
+    // Work on a copy of the original pixels each redraw
+    const out = new ImageData(
+      new Uint8ClampedArray(baseImageData.data),
+      baseImageData.width,
+      baseImageData.height
+    );
+
+    const d = out.data;
+
+    const L = Math.max(0, lumDepth);
+    const dep = Math.max(0, depth);
+
+    // Multipliers from the original pseudo-code approach
+    let mr, mg, mb;
+    if (dep <= L) {
+      mr = Math.pow(COMP.r, dep);
+      mg = Math.pow(COMP.g, dep);
+      mb = 1.0; // as in Box 1
+    } else {
+      const mrL = Math.pow(COMP.r, L);
+      const mgL = Math.pow(COMP.g, L);
+      const delta = dep - L;
+      mr = mrL * Math.pow(RAW.r, delta);
+      mg = mgL * Math.pow(RAW.g, delta);
+      mb = Math.pow(RAW.b, delta);
+    }
+
+    // Transform pixels
+    for (let i = 0; i < d.length; i += 4) {
+      d[i]     = clamp255(d[i]     * mr); // R
+      d[i + 1] = clamp255(d[i + 1] * mg); // G
+      d[i + 2] = clamp255(d[i + 2] * mb); // B
+    }
+
+    ctx.putImageData(out, 0, 0);
+
+    // Flashlight: reveal original only in a clipped circle
+    if (flashInput.checked && mouse.inside) {
+      const r = parseInt(radInput.value, 10);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(mouse.x, mouse.y, r, 0, Math.PI * 2);
+      ctx.clip();
+
+      // drawImage respects clipping; putImageData does not
+      ctx.drawImage(origCanvas, 0, 0);
+
+      ctx.restore();
+
+      // Outline the flashlight circle
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(mouse.x, mouse.y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(0,0,0,0.6)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function redraw() {
+    const depth = parseInt(depthInput.value, 10);
+    const lumDepth = parseInt(lumInput.value, 10);
+
+    depthLabel.textContent = depth;
+    lumLabel.textContent = lumDepth;
+    radLabel.textContent = radInput.value;
+
+    applyDepthTransform(depth, lumDepth);
+  }
+
+  function loadImageFromFile(file) {
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => {
+      img = im;
+      fitAndDrawOriginal();
+      redraw();
+      URL.revokeObjectURL(url);
+    };
+    im.src = url;
+  }
+
+  fileInput.addEventListener('change', (e) => {
+    if (e.target.files && e.target.files[0]) loadImageFromFile(e.target.files[0]);
+  });
+
+  depthInput.addEventListener('input', redraw);
+  lumInput.addEventListener('input', redraw);
+  radInput.addEventListener('input', redraw);
+  flashInput.addEventListener('change', redraw);
+
+  canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = (e.clientX - rect.left) * (canvas.width / rect.width);
+    mouse.y = (e.clientY - rect.top) * (canvas.height / rect.height);
+    mouse.inside = true;
+    if (flashInput.checked) redraw();
+  });
+  canvas.addEventListener('mouseleave', () => {
+    mouse.inside = false;
+    if (flashInput.checked) redraw();
+  });
+
+  // Demo image (may be blocked by CORS in some contexts; local upload is most reliable)
+  demoBtn.addEventListener('click', () => {
+    const im = new Image();
+    im.crossOrigin = "anonymous";
+    im.onload = () => {
+      img = im;
+      fitAndDrawOriginal();
+      redraw();
+    };
+    im.src = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/49/Fish_icon.svg/1024px-Fish_icon.svg.png";
+  });
+
+  // Initial blank canvas
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#666";
+  ctx.fillText("Load an image to start.", 20, 30);
+})();
+</script>
+</body>
+</html>
